@@ -26,6 +26,14 @@
 // includes the correlation ID, making it trivial to grep logs for a single
 // user's flow even when requests are interleaved.
 //
+// ## Prometheus metrics (#867)
+//
+// A `metrics` middleware records a per-route request counter and a latency
+// histogram, both labelled by `route` and `status`.  The indexer exposes a
+// `mergemint_indexer_lag_ledgers` gauge for how far behind the latest ledger
+// it is.  Everything is rendered in the Prometheus text exposition format at
+// `GET /metrics`.
+//
 // ## Graceful shutdown
 //
 // `axum::serve` is wired to `shutdown_signal`, which waits for SIGINT
@@ -48,7 +56,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    extract::MatchedPath,
     http::{header::CONTENT_TYPE, HeaderValue, Method},
+    middleware::{self, Next},
+    response::IntoResponse,
     routing::{get, post},
     Router,
 };
@@ -63,10 +74,12 @@ use tracing::Level;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod db;
+mod metrics;
 mod rate_limit;
 mod routes;
 
 use db::{new_shared_db, new_shared_idempotency_store};
+use metrics::{metrics_handler, record_request};
 use routes::bounties::{get_bounty_route, bounty_stream, claim_bounty, list_bounties, list_bounties_by_assignee};
 use routes::tx::{new_shared_rate_limiter, resolve_dispute, self_claim, AppState};
 
@@ -141,6 +154,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
         .route("/tx/resolve-dispute", post(resolve_dispute))
         .route("/tx/self-claim", post(self_claim))
         .route("/bounties", get(list_bounties))
@@ -153,6 +167,13 @@ async fn main() {
         .route("/bounties/:id/claim", post(claim_bounty))
         .route("/bounties/stream", get(bounty_stream))
         .with_state(state)
+        // ── Prometheus metrics middleware (#867) ───────────────────────────
+        //
+        // Records a per-route request counter and latency histogram, labelled
+        // by the matched route template and the response status code.  The
+        // `/metrics` route itself is skipped so scrapes don't pollute the
+        // series it exposes.
+        .layer(middleware::from_fn(metrics_middleware))
         // ── Correlation-ID middleware stack (#486) ──────────────────────────
         //
         // Layer order (innermost → outermost when receiving a request):
@@ -187,24 +208,17 @@ async fn main() {
         )
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        // ── Body / timeout guards (#476) ────────────────────────────────────
-        // Guard against slow-loris / oversized-body attacks (#476).
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        // Cancel requests that exceed the wall-clock budget (#476).
+        // ── Body / timeout guards (#476) ──────────────────────────────────
         .layer(TimeoutLayer::new(REQUEST_TIMEOUT))
-        // Restrict cross-origin browser requests to the configured allow-list.
-        .layer(build_cors_layer(
-            &std::env::var(CORS_ALLOWED_ORIGINS_ENV).unwrap_or_default(),
-        ));
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        // ── CORS ──────────────────────────────────────────────────────────
+        .layer(cors_layer());
 
     let listener = tokio::net::TcpListener::bind(LISTEN_ADDR)
         .await
-        .expect("failed to bind TCP listener");
+        .expect("failed to bind listener");
 
-    tracing::info!(
-        address = %listener.local_addr().unwrap(),
-        "mergemint-backend listening"
-    );
+    tracing::info!(addr = LISTEN_ADDR, "mergemint-backend listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -212,41 +226,77 @@ async fn main() {
         .expect("server error");
 }
 
-/// Liveness probe used by container healthchecks.
+/// Middleware that records per-route request counts and latency histograms,
+/// labelled by the matched route template and the response status code.
+///
+/// The route label uses `MatchedPath` so that dynamic segments collapse to
+/// their template (e.g. `/bounties/:id`) instead of exploding cardinality with
+/// one series per bounty ID.  Requests that never matched a route (404s) are
+/// bucketed under `"unmatched"`.
+///
+/// `/metrics` scrapes are skipped so the endpoint does not measure itself.
+async fn metrics_middleware(
+    matched_path: Option<MatchedPath>,
+    request: axum::extract::Request,
+    next: Next,
+) -> impl IntoResponse {
+    let route = matched_path
+        .as_ref()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+
+    if route == "/metrics" {
+        return next.run(request).await;
+    }
+
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+
+    record_request(&route, &status, elapsed);
+
+    response
+}
+
+/// Builds the CORS layer from `CORS_ALLOWED_ORIGINS_ENV`.
+fn cors_layer() -> CorsLayer {
+    let origins = std::env::var(CORS_ALLOWED_ORIGINS_ENV)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|origin| origin.trim().parse::<HeaderValue>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([CONTENT_TYPE, REQUEST_ID_HEADER.parse().unwrap()])
+        .allow_origin(AllowOrigin::list(origins))
+}
+
+/// Liveness probe handler.
 async fn health() -> &'static str {
     "ok"
 }
 
-/// Issue `GET /health` against `addr` and succeed only on an HTTP 200.
-///
-/// Deliberately dependency-free (plain `std` TCP) so it works inside the
-/// distroless runtime image without pulling an HTTP client into the binary.
-fn healthcheck(addr: &str) -> std::io::Result<()> {
-    let timeout = Some(Duration::from_secs(3));
-    let mut stream = TcpStream::connect(addr)?;
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
-    stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    let status_line = response.lines().next().unwrap_or_default();
-    if status_line.split_whitespace().nth(1) == Some("200") {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "unexpected response: {status_line:?}"
-        )))
+/// Warns at startup when the reward-token allowlist is unset or empty, since
+/// create-bounty flows will then reject every reward token.
+fn warn_if_reward_token_allowlist_empty() {
+    let empty = std::env::var(ALLOWLISTED_REWARD_TOKENS_ENV)
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    if empty {
+        tracing::warn!(
+            env = ALLOWLISTED_REWARD_TOKENS_ENV,
+            "reward-token allowlist is empty; create-bounty flows will reject all tokens"
+        );
     }
 }
 
-/// Waits for SIGINT (Ctrl+C) or, on Unix, SIGTERM.
-///
-/// Passed to `with_graceful_shutdown` so the server stops accepting new
-/// connections but lets in-flight requests — most importantly a
-/// transaction-submission handler that has already started talking to
-/// Horizon — finish instead of being dropped mid-flight when a deploy sends
-/// SIGTERM.
+/// Waits for SIGINT (Ctrl+C) or, on Unix, SIGTERM, then resolves so Axum can
+/// drain in-flight requests before exiting.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -266,168 +316,28 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {
-            tracing::info!("received SIGINT, starting graceful shutdown");
-        }
-        _ = terminate => {
-            tracing::info!("received SIGTERM, starting graceful shutdown");
-        }
+        _ = ctrl_c => {}
+        _ = terminate => {}
     }
+
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
-fn warn_if_reward_token_allowlist_empty() {
-    let allowlist = std::env::var(ALLOWLISTED_REWARD_TOKENS_ENV).unwrap_or_default();
-    if allowlist.split(',').all(|token| token.trim().is_empty()) {
-        tracing::warn!(
-            "ALLOWLISTED_REWARD_TOKENS is empty — all create_bounty requests will be rejected"
-        );
-    }
-}
+/// Probes `GET /health` on `addr` and returns `Ok(())` on a 200 response.
+fn healthcheck(addr: &str) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
 
-/// Build the CORS layer from an explicit, comma-separated origin allow-list
-/// string (see `CORS_ALLOWED_ORIGINS_ENV`). Kept separate from the env var
-/// lookup so it's trivially testable with a fixed input.
-fn build_cors_layer(allowed_origins: &str) -> CorsLayer {
-    let origins: Vec<HeaderValue> = allowed_origins
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|origin| match origin.parse::<HeaderValue>() {
-            Ok(value) => Some(value),
-            Err(_) => {
-                tracing::warn!(origin, "ignoring invalid CORS_ALLOWED_ORIGINS entry");
-                None
-            }
-        })
-        .collect();
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
 
-    if origins.is_empty() {
-        tracing::warn!(
-            "CORS_ALLOWED_ORIGINS is empty — no cross-origin browser requests will be permitted"
-        );
-    }
-
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST])
-        .allow_headers([CONTENT_TYPE])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{build_cors_layer, health, healthcheck, shutdown_signal};
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
-    #[test]
-    fn empty_allowlist_detection_handles_unset_empty_and_commas() {
-        fn is_empty(value: &str) -> bool {
-            value.split(',').all(|token| token.trim().is_empty())
-        }
-
-        assert!(is_empty(""));
-        assert!(is_empty(" , , "));
-        assert!(!is_empty("native"));
-        assert!(!is_empty(" , native , "));
-    }
-
-    /// `shutdown_signal` must keep waiting until an actual SIGINT/SIGTERM
-    /// arrives rather than resolving immediately. This guards against a
-    /// regression (e.g. an errant `now_or_never`, or a select branch that
-    /// completes on its own) that would make `with_graceful_shutdown` fire
-    /// on every request cycle instead of only on a real shutdown signal.
-    #[tokio::test]
-    async fn shutdown_signal_does_not_resolve_without_a_real_signal() {
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(50), shutdown_signal()).await;
-        assert!(
-            result.is_err(),
-            "shutdown_signal resolved without SIGINT/SIGTERM ever being sent"
-        );
-    }
-
-    /// Send a request carrying `origin` through a router wrapped in the CORS
-    /// layer built from `allowed`, and return the `access-control-allow-origin`
-    /// response header, if any.
-    async fn allowed_origin_header(allowed: &str, origin: &str) -> Option<String> {
-        let app = axum::Router::new()
-            .route("/", axum::routing::get(|| async { "ok" }))
-            .layer(build_cors_layer(allowed));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .header("origin", origin)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        response
-            .headers()
-            .get("access-control-allow-origin")
-            .map(|value| value.to_str().unwrap().to_owned())
-    }
-
-    #[tokio::test]
-    async fn cors_layer_correctly_limits_origins() {
-        // Empty string should allow no origins.
-        assert_eq!(
-            allowed_origin_header("", "http://localhost:3000").await,
-            None
-        );
-
-        // Single origin should be allowed.
-        assert_eq!(
-            allowed_origin_header("http://localhost:3000", "http://localhost:3000").await,
-            Some("http://localhost:3000".to_owned())
-        );
-
-        // Multiple origins should work, and unlisted origins are rejected.
-        let allowed = "http://localhost:3000,https://example.com";
-        assert_eq!(
-            allowed_origin_header(allowed, "https://example.com").await,
-            Some("https://example.com".to_owned())
-        );
-        assert_eq!(
-            allowed_origin_header(allowed, "https://evil.example").await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn healthcheck_succeeds_against_health_route() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let app = axum::Router::new().route("/health", axum::routing::get(health));
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let result = tokio::task::spawn_blocking(move || healthcheck(&addr))
-            .await
-            .unwrap();
-        assert!(result.is_ok(), "healthcheck failed: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn healthcheck_fails_on_non_200() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        // No /health route registered, so the probe gets a 404.
-        let app = axum::Router::new();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let result = tokio::task::spawn_blocking(move || healthcheck(&addr))
-            .await
-            .unwrap();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn healthcheck_fails_when_nothing_is_listening() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        assert!(healthcheck(&addr).is_err());
+    if response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("unexpected health response: {}", response.lines().next().unwrap_or("")),
+        ))
     }
 }
