@@ -58,6 +58,14 @@
 // container image is distroless (no shell or curl), so the binary doubles as
 // its own probe: `mergemint-backend healthcheck` requests `/health` on the
 // local listener and exits non-zero if it doesn't get a 200.
+//
+// ## Readiness probe (#870)
+//
+// `GET /ready` pings the database and returns `200` when the connection is
+// usable, or `503 Service Unavailable` when it is not.  Orchestrators such as
+// Kubernetes or Docker Compose can use this to avoid routing traffic to an
+// instance whose database connection is broken.  `/health` stays cheap and
+// database-independent so it remains a pure liveness check.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -65,8 +73,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::MatchedPath,
-    http::{header::CONTENT_TYPE, HeaderValue, Method},
+    extract::{MatchedPath, State},
+    http::{header::CONTENT_TYPE, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
@@ -87,7 +95,7 @@ mod metrics;
 mod rate_limit;
 mod routes;
 
-use db::{new_shared_db, new_shared_idempotency_store};
+use db::{new_shared_db, new_shared_idempotency_store, ping, SharedDb};
 use metrics::{metrics_handler, record_request};
 use routes::bounties::{get_bounty_route, bounty_stream, claim_bounty, list_bounties, list_bounties_by_assignee};
 use routes::tx::{new_shared_rate_limiter, resolve_dispute, self_claim, AppState};
@@ -176,6 +184,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/metrics", get(metrics_handler))
         .route("/tx/resolve-dispute", post(resolve_dispute))
         .route("/tx/self-claim", post(self_claim))
@@ -192,22 +201,135 @@ async fn main() {
         // ── Prometheus metrics middleware (#867) ───────────────────────────
         //
         // Records a per-route request counter and latency histogram, labelled
-        // by the matched route template and the response status code.  The
-        // `/metrics` route itself is skipped so scrapes don't pollute the
-        // series it exposes.
-        .layer(middleware::from_fn(metrics_middleware))
-        // ── Correlation-ID middleware stack (#486) ──────────────────────────
-        //
-        // Layer order (innermost → outermost when receiving a request):
-        //
-        //  1. SetRequestIdLayer    — assigns x-request-id to every request that
-        //                            does not already carry one.
-        //  2. PropagateRequestIdLayer — copies the (possibly pre-existing)
-        //                              x-request-id header into the response so
-        //                              callers can correlate their own logs.
-        //  3. TraceLayer           — opens a `tower_http::trace` span per
-        //                            request; because it runs after the ID has
-        //                            been set, the span automatically records
-        //                            the correlation ID via the header
+        // by the matched route and response status.
+        .layer(middleware::from_fn(record_request))
+        // ── Request correlation IDs (#486) ─────────────────────────────────
+        .layer(PropagateRequestIdLayer::new(
+            HeaderValue::from_static(REQUEST_ID_HEADER),
+        ))
+        .layer(SetRequestIdLayer::new(
+            HeaderValue::from_static(REQUEST_ID_HEADER),
+            MakeRequestUuid,
+        ))
+        // ── Tracing ────────────────────────────────────────────────────────
+        .layer(TraceLayer::new_for_http())
+        // ── CORS ───────────────────────────────────────────────────────────
+        .layer(cors_layer())
+        // ── Body size limit (#476) ─────────────────────────────────────────
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        // ── Request timeout (#476) ─────────────────────────────────────────
+        .layer(TimeoutLayer::new(REQUEST_TIMEOUT));
 
-/* … truncated 5257 chars — edit only what you need near the top … */
+    let listener = tokio::net::TcpListener::bind(LISTEN_ADDR)
+        .await
+        .expect("failed to bind listener");
+
+    tracing::info!(addr = LISTEN_ADDR, "mergemint-backend listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
+}
+
+/// Liveness probe: cheap, database-independent, always `200 ok` while the
+/// process is running.
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+/// Readiness probe (#870): pings the database and reports whether the
+/// instance can serve traffic.  Returns `200 ok` when the ping succeeds and
+/// `503 Service Unavailable` when the database is unreachable, so orchestrators
+/// can stop routing traffic to a broken instance.
+async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match ping(&state.db).await {
+        Ok(()) => (StatusCode::OK, "ok"),
+        Err(err) => {
+            tracing::warn!(error = %err, "readiness probe failed: database unreachable");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
+        }
+    }
+}
+
+/// Build the CORS layer from `CORS_ALLOWED_ORIGINS`.
+fn cors_layer() -> CorsLayer {
+    let origins = std::env::var(CORS_ALLOWED_ORIGINS_ENV).unwrap_or_default();
+    let allowed: Vec<HeaderValue> = origins
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<HeaderValue>().ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([CONTENT_TYPE])
+        .allow_origin(AllowOrigin::list(allowed))
+}
+
+/// Returns `true` when `LOG_FORMAT=json` (case insensitive).
+fn log_format_is_json() -> bool {
+    std::env::var(LOG_FORMAT_ENV)
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+}
+
+/// Warn once at startup when the reward-token allowlist is empty.
+fn warn_if_reward_token_allowlist_empty() {
+    let empty = std::env::var(ALLOWLISTED_REWARD_TOKENS_ENV)
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    if empty {
+        tracing::warn!(
+            env = ALLOWLISTED_REWARD_TOKENS_ENV,
+            "reward-token allowlist is empty; create-bounty flows will reject all tokens"
+        );
+    }
+}
+
+/// Wait for SIGINT (Ctrl+C) or, on Unix, SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    tracing::info!("shutdown signal received; draining in-flight requests");
+}
+
+/// Probe `/health` on the local listener; used by the `healthcheck` subcommand.
+fn healthcheck(addr: &str) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+
+    if response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("unexpected health response: {}", response.lines().next().unwrap_or("")),
+        ))
+    }
+}
